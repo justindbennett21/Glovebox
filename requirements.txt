@@ -1,0 +1,5 @@
+streamlit>=1.50
+gspread>=6.0
+pandas>=2.0
+requests>=2.31
+pillow>=10.0
