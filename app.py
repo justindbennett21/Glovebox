@@ -364,13 +364,19 @@ def fuel_with_mpg(fuel: pd.DataFrame) -> pd.DataFrame:
     - Full tank: MPG = miles since the last full tank / all gallons bought since then.
     - Partial fill: gallons carry forward to the next full tank; no MPG on this row.
     - Missed a fill-up before this one: the chain restarts; no MPG on this row.
+    - Gallons unknown (older records): the chain restarts at this fill-up.
     """
-    f = fuel.sort_values(["odometer", "date"]).copy()
+    f = fuel.assign(_partial=~fuel["full_tank"].astype(bool)).sort_values(
+        ["odometer", "date", "_partial"]).drop(columns="_partial")
     mpg, seg_miles, seg_gal, seg_cost = [], [], [], []
     anchor, acc_gal, acc_cost = None, 0.0, 0.0
     for _, r in f.iterrows():
         m = sm = sg = sc = None
-        if r["missed_before"]:
+        if pd.isna(r["odometer"]):
+            pass  # no mileage: can't place it, leave it out of MPG
+        elif pd.isna(r["gallons"]) or not r["gallons"]:
+            anchor, acc_gal, acc_cost = r["odometer"], 0.0, 0.0
+        elif r["missed_before"]:
             anchor, acc_gal, acc_cost = (r["odometer"] if r["full_tank"] else None), 0.0, 0.0
         else:
             acc_gal += r["gallons"] or 0
@@ -593,7 +599,8 @@ with tab_time:
     fm = fuel_with_mpg(fuel) if not fuel.empty else fuel.assign(mpg=None)
     items = []
     for _, r in fm.iterrows():
-        bits = [f"{r['gallons']:.3f} gal", f"${r['price_per_gallon']:.3f}/gal"]
+        bits = ([f"{r['gallons']:.3f} gal", f"${r['price_per_gallon']:.3f}/gal"]
+                if pd.notna(r["gallons"]) and r["gallons"] else ["gallons not recorded"])
         if pd.notna(r["mpg"]):
             bits.append(f"{r['mpg']:.1f} mpg")
         if not r["full_tank"]:
@@ -772,7 +779,7 @@ with tab_trend:
             st.markdown("**MPG over time**")
             st.line_chart(f.dropna(subset=["mpg"]).set_index("date")["mpg"], height=220)
         st.markdown("**Price per gallon**")
-        st.line_chart(f.set_index("date")["price_per_gallon"], height=220)
+        st.line_chart(f.dropna(subset=["price_per_gallon"]).set_index("date")["price_per_gallon"], height=220)
         spend = pd.concat([
             fuel.assign(kind="Gas", amt=fuel["total_cost"])[["date", "kind", "amt"]],
             svc.assign(kind="Service", amt=svc["cost"])[["date", "kind", "amt"]],
