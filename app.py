@@ -12,12 +12,23 @@ import io
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import gspread
 import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image, ImageOps
+
+try:  # lets Pillow read iPhone HEIC photos so they're saved as viewable JPEGs
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
+MIME_BY_EXT = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".png": "image/png", ".webp": "image/webp", ".heic": "image/heic",
+               ".heif": "image/heif"}
 
 st.set_page_config(page_title="Glovebox Car Log", page_icon="🚗", layout="centered")
 
@@ -103,7 +114,7 @@ SCHEDULE_TEMPLATES = {
     ],
 }
 DUE_SOON_MILES, DUE_SOON_DAYS = 1000, 30
-RECEIPT_TYPES = ["jpg", "jpeg", "png", "heic", "webp", "pdf"]
+RECEIPT_TYPES = ["jpg", "jpeg", "png", "heic", "heif", "webp", "pdf"]
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +338,10 @@ def _call_receipts(payload: dict) -> dict:
 
 
 def upload_receipt(file, label: str) -> tuple[str, str]:
-    data, mime, name = file.getvalue(), file.type or "application/octet-stream", file.name
+    data, name = file.getvalue(), file.name
+    ext = Path(name).suffix.lower()
+    # Phones don't always report the file type; go by the extension so Drive can preview it.
+    mime = MIME_BY_EXT.get(ext) or file.type or "application/octet-stream"
     if mime.startswith("image/"):
         # Shrink big phone photos so uploads are quick; keep the original if Pillow can't read it.
         try:
@@ -345,6 +359,15 @@ def upload_receipt(file, label: str) -> tuple[str, str]:
         "data": base64.b64encode(data).decode(),
     })
     return res["url"], res["id"]
+
+
+def receipt_link(url: str) -> str:
+    """Open Drive links with the right Google account when several are signed in.
+    Set `google_account = "you@gmail.com"` in secrets to enable."""
+    acct = str(st.secrets.get("google_account", "")).strip()
+    if not url or not acct or "authuser=" in url:
+        return url
+    return f"{url}{'&' if '?' in url else '?'}authuser={quote(acct)}"
 
 
 def trash_receipt(file_id: str):
@@ -642,7 +665,7 @@ with tab_time:
                 if r["notes"]:
                     st.write(r["notes"])
                 if r["receipt"]:
-                    st.link_button("📄 View receipt", r["receipt"])
+                    st.link_button("📄 View receipt", receipt_link(r["receipt"]))
 
 # ---- Maintenance schedule vs. odometer -------------------------------------
 STATUS_ICON = {"Overdue": "🔴", "Due soon": "🟠", "OK": "🟢", "No record": "⚪"}
@@ -793,6 +816,33 @@ with tab_trend:
 # ---- Fix or delete an entry ------------------------------------------------
 with tab_fix:
     st.caption("Correct a typo, add a receipt to an older service, or delete an entry.")
+    with st.expander("🩺 Check receipts connection"):
+        if not receipts_enabled():
+            st.warning("Receipts are off: `receipts_url` or `receipts_token` is missing from "
+                       "your Streamlit secrets, so the upload box is hidden.")
+        elif st.button("Run check", key="rcheck"):
+            try:
+                r = requests.post(st.secrets["receipts_url"], timeout=60,
+                                  json={"action": "ping", "token": st.secrets["receipts_token"]})
+                try:
+                    res = r.json()
+                except ValueError:
+                    res = None
+                if res is None:
+                    st.error(f"The receipts script answered with a web page, not data "
+                             f"(status {r.status_code}). Usually the Web app's 'Who has access' "
+                             f"isn't set to Anyone, or the URL isn't the /exec one.")
+                    st.code(r.text[:400])
+                elif res.get("error") == "Not allowed":
+                    st.error("Connected, but the secret phrase doesn't match. Make "
+                             "`receipts_token` in secrets identical to TOKEN in the script.")
+                elif res.get("error") == "Unknown action":
+                    st.success("✅ Receipts connection works. The script is reachable and the "
+                               "secret phrase matches.")
+                else:
+                    st.warning(f"Unexpected answer: {res}")
+            except Exception as e:
+                st.error(f"Couldn't reach the receipts script: {e}")
     options = {}
     for _, r in svc.sort_values("date", ascending=False).iterrows():
         tag = " 📄" if r["receipt_url"] else ""
@@ -832,7 +882,7 @@ with tab_fix:
                 e_notes = st.text_area("Notes", value=r["notes"])
                 e_file = None
                 if r["receipt_url"]:
-                    st.markdown(f"Current receipt: [open]({r['receipt_url']})")
+                    st.markdown(f"Current receipt: [open]({receipt_link(r['receipt_url'])})")
                 if receipts_enabled():
                     e_file = st.file_uploader(
                         "Replace receipt" if r["receipt_url"] else "Add receipt",
