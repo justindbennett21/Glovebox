@@ -30,7 +30,10 @@ MIME_BY_EXT = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/
                ".png": "image/png", ".webp": "image/webp", ".heic": "image/heic",
                ".heif": "image/heif"}
 
-st.set_page_config(page_title="Glovebox Car Log", page_icon="🚗", layout="centered")
+_icon_path = Path(__file__).with_name("glovebox_icon.png")
+st.set_page_config(page_title="Glovebox Car Log",
+                   page_icon=Image.open(_icon_path) if _icon_path.exists() else "🚗",
+                   layout="centered")
 
 # ---------------------------------------------------------------------------
 # Sheet layout. The app creates these tabs and header rows if they are missing.
@@ -40,7 +43,8 @@ TABS = {
     "Fuel": ["entry_id", "car_id", "date", "odometer", "gallons", "total_cost",
              "price_per_gallon", "full_tank", "missed_before", "entered_by", "logged_at"],
     "Service": ["entry_id", "car_id", "date", "odometer", "service_type", "cost", "shop",
-                "notes", "receipt_url", "receipt_file_id", "entered_by", "logged_at"],
+                "notes", "receipt_url", "receipt_file_id", "entered_by", "logged_at",
+                "visit_id"],
     "Schedule": ["car_id", "item", "every_miles", "every_months", "first_due_miles",
                  "first_due_months", "counts_as", "notes"],
 }
@@ -51,7 +55,7 @@ BOOLS = ("full_tank", "missed_before")
 SERVICE_TYPES = [
     "Oil change", "Tire rotation", "New tires", "Brake inspection", "Brake pads",
     "Brake rotors", "Brake fluid", "Battery", "Engine air filter", "Cabin filter",
-    "Wiper blades", "Alignment", "Coolant flush", "Inverter coolant",
+    "Wiper blades", "Alignment", "Wheel bearing", "Coolant flush", "Inverter coolant",
     "Transmission (CVT) fluid", "Rear differential fluid", "Hybrid battery filter", "Spark plugs",
     "State inspection", "Registration", "Car wash", "Other",
 ]
@@ -159,18 +163,63 @@ def flash(msg: str):
 # Password gate (one shared household password stored in Streamlit secrets)
 # ---------------------------------------------------------------------------
 def password_ok() -> bool:
+    """Ways in, set in secrets:
+    - access_key: a personal link (…streamlit.app/?key=...) opens the app with no typing.
+    - app_password: the password screen, for anyone without the link.
+    - neither set: the app is open to anyone with the URL.
+    """
     if st.session_state.get("authed"):
         return True
+    key = str(st.secrets.get("access_key", "")).strip()
+    pw_secret = str(st.secrets.get("app_password", "")).strip()
+    if key and hmac.compare_digest(str(st.query_params.get("key", "")), key):
+        st.session_state.authed = True
+        return True
+    if not key and not pw_secret:
+        return True
     st.title("🚗 Glovebox")
+    if not pw_secret:
+        st.info("Open Glovebox from your personal link or home screen icon.")
+        return False
     with st.form("login"):
         pw = st.text_input("Password", type="password")
         if st.form_submit_button("Open", width="stretch"):
-            if hmac.compare_digest(pw, st.secrets["app_password"]):
+            if hmac.compare_digest(pw, pw_secret):
                 st.session_state.authed = True
                 st.rerun()
             else:
                 st.error("That password didn't match. Try again.")
     return False
+
+
+# ---------------------------------------------------------------------------
+# Google sign-in gate (used when [auth] and [allowed_users] are in secrets)
+# ---------------------------------------------------------------------------
+def allowed_users() -> dict:
+    """{"email": "Display name"} from secrets, emails lowercased."""
+    return {str(k).strip().lower(): str(v) for k, v in st.secrets.get("allowed_users", {}).items()}
+
+
+def google_login_enabled() -> bool:
+    return "auth" in st.secrets and bool(allowed_users())
+
+
+def google_ok() -> str | None:
+    """Returns the signed-in person's name, or None after drawing the sign-in screen."""
+    if not st.user.get("is_logged_in", False):
+        st.title("🚗 Glovebox")
+        st.write("Sign in with your Google account to open your car log.")
+        st.button("Sign in with Google", type="primary", width="stretch", on_click=st.login)
+        return None
+    email = str(st.user.get("email", "")).strip().lower()
+    name = allowed_users().get(email)
+    if not name:
+        st.title("🚗 Glovebox")
+        st.error(f"{email or 'This account'} isn't on the list for this app. "
+                 "Ask Justin to add it, or sign in with a different Google account.")
+        st.button("Sign out", on_click=st.logout)
+        return None
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +265,7 @@ def load(name: str) -> pd.DataFrame:
     if "missed_before" in df.columns:
         df["missed_before"] = df["missed_before"].map(lambda v: to_bool(v, default=False))
     for col in ("car_id", "entry_id", "receipt_url", "receipt_file_id", "notes", "shop",
-                "item", "counts_as", "service_type"):
+                "item", "counts_as", "service_type", "visit_id"):
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
     return df
@@ -239,6 +288,47 @@ def row_values(name: str, data: dict) -> list:
 def append(name: str, data: dict):
     ws(name).append_row(row_values(name, data), value_input_option="USER_ENTERED")
     load.clear()
+
+
+def append_many(name: str, rows: list[dict]):
+    ws(name).append_rows([row_values(name, d) for d in rows], value_input_option="USER_ENTERED")
+    load.clear()
+
+
+def visit_key(r) -> str:
+    """Rows from one shop visit share a key. Older rows without a visit_id are grouped
+    by date + mileage + shop."""
+    if r.get("visit_id"):
+        return r["visit_id"]
+    if pd.isna(r.get("date")):
+        return r["entry_id"]
+    odo = r.get("odometer")
+    return f"{r['date']:%Y-%m-%d}|{'' if pd.isna(odo) else int(odo)}|{r.get('shop', '')}"
+
+
+def receipt_shared(file_id: str, other_than: set) -> bool:
+    """True if another service row still points at this receipt file."""
+    if not file_id:
+        return False
+    rows = load("Service")
+    return bool(((rows["receipt_file_id"] == file_id) & ~rows["entry_id"].isin(other_than)).any())
+
+
+def monthly_spend(fuel_df: pd.DataFrame, svc_df: pd.DataFrame) -> pd.DataFrame:
+    """Gas and service spending per calendar month, from the first record to this month.
+    Months with nothing logged are included as $0."""
+    sp = pd.concat([
+        pd.DataFrame({"date": fuel_df["date"], "kind": "Gas", "amt": fuel_df["total_cost"]}),
+        pd.DataFrame({"date": svc_df["date"], "kind": "Service", "amt": svc_df["cost"]}),
+    ]).dropna(subset=["date"])
+    if sp.empty:
+        return pd.DataFrame(columns=["Gas", "Service"])
+    sp["amt"] = sp["amt"].fillna(0)
+    sp["month"] = sp["date"].dt.to_period("M")
+    pv = sp.pivot_table(index="month", columns="kind", values="amt", aggfunc="sum")
+    pv = pv.reindex(columns=["Gas", "Service"], fill_value=0)
+    months = pd.period_range(pv.index.min(), pd.Timestamp(date.today()).to_period("M"), freq="M")
+    return pv.reindex(months, fill_value=0).fillna(0)
 
 
 def update(name: str, entry_id: str, data: dict):
@@ -442,10 +532,17 @@ def order_warning(fuel: pd.DataFrame, d: date, odo: float, skip_id: str = "") ->
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-if not password_ok():
+me = None
+if google_login_enabled():
+    me = google_ok()
+    if not me:
+        st.stop()
+    drivers = list(dict.fromkeys(allowed_users().values()))
+elif not password_ok():
     st.stop()
+else:
+    drivers = list(st.secrets.get("drivers", ["Me"]))
 
-drivers = list(st.secrets.get("drivers", ["Me"]))
 st.title("🚗 Glovebox")
 
 if msg := st.session_state.pop("_flash", None):
@@ -453,7 +550,8 @@ if msg := st.session_state.pop("_flash", None):
 
 top1, top2 = st.columns([2, 1])
 with top2:
-    driver = st.selectbox("Who's logging?", drivers, key="driver")
+    driver = st.selectbox("Who's logging?", drivers, key="driver",
+                          index=drivers.index(me) if me in drivers else 0)
 
 cars = load("Cars")
 
@@ -557,46 +655,78 @@ with tab_fuel:
 
 # ---- Service form ----------------------------------------------------------
 with tab_svc:
+    # Plain widgets (not a form) so cost boxes appear as you pick services.
     k = form_key("svc")
-    with st.form(k):
-        c1, c2 = st.columns(2)
-        s_date = c1.date_input("Date", value=date.today(), max_value=date.today(), key=k + "d")
-        s_odo = c2.number_input("Mileage (odometer)", min_value=0, step=1, value=None,
-                                placeholder="98450", key=k + "o")
-        s_type = st.selectbox("Service", service_choices, key=k + "t")
-        s_other = st.text_input("If Other, what was done?", key=k + "x")
-        c3, c4 = st.columns(2)
-        s_cost = c3.number_input("Cost ($)", min_value=0.0, step=0.01, value=None,
-                                 format="%.2f", key=k + "c")
-        s_shop = c4.text_input("Shop", placeholder="Optional", key=k + "s")
-        s_notes = st.text_area("Notes", placeholder="Parts used, next due, warranty...", key=k + "n")
-        s_file = None
-        if receipts_enabled():
-            s_file = st.file_uploader("Receipt (photo or PDF)", type=RECEIPT_TYPES, key=k + "r")
-        if st.form_submit_button("Log service", width="stretch", type="primary"):
-            kind = s_other.strip() if s_type == "Other" else s_type
-            if not kind:
-                st.error("Describe the service, like 'Replaced headlight'.")
-            else:
-                url = fid = ""
-                if s_file:
-                    try:
-                        with st.spinner("Uploading receipt..."):
-                            url, fid = upload_receipt(s_file, f"{s_date.isoformat()} {car_name} {kind}")
-                    except Exception as e:
-                        st.error(f"Receipt didn't upload ({e}). The service wasn't saved yet. Try again.")
-                        st.stop()
-                append("Service", {"entry_id": uuid.uuid4().hex[:10], "car_id": car_id,
-                                   "date": s_date.isoformat(),
-                                   "odometer": int(s_odo) if s_odo else "",
-                                   "service_type": kind,
-                                   "cost": round(s_cost, 2) if s_cost is not None else "",
-                                   "shop": s_shop.strip(), "notes": s_notes.strip(),
-                                   "receipt_url": url, "receipt_file_id": fid,
-                                   "entered_by": driver, "logged_at": now_stamp()})
-                reset_form("svc")
-                flash("Service saved" + (" with receipt" if url else ""))
-                st.rerun()
+    c1, c2 = st.columns(2)
+    s_date = c1.date_input("Date", value=date.today(), max_value=date.today(), key=k + "d")
+    s_odo = c2.number_input("Mileage (odometer)", min_value=0, step=1, value=None,
+                            placeholder="98450", key=k + "o")
+    s_types = st.multiselect("What was done? Pick everything from this visit",
+                             [c for c in service_choices if c != "Other"], key=k + "t",
+                             placeholder="Oil change, Tire rotation...")
+    s_other = st.text_input("Anything not in the list? Separate items with commas",
+                            placeholder="Rear wheel bearings, Headlight bulb", key=k + "x")
+    jobs = list(dict.fromkeys(s_types + [x.strip() for x in s_other.split(",") if x.strip()]))
+
+    per_item = False
+    if len(jobs) > 1:
+        per_item = st.radio("Cost", ["One total for the visit", "A cost for each item"],
+                            horizontal=True, key=k + "cm") == "A cost for each item"
+    item_costs, s_total = {}, None
+    if per_item:
+        cols = st.columns(2)
+        for i, j in enumerate(jobs):
+            item_costs[j] = cols[i % 2].number_input(f"{j} ($)", min_value=0.0, step=0.01,
+                                                     value=None, format="%.2f", key=f"{k}c_{j}")
+    else:
+        s_total = st.number_input("Total cost ($)", min_value=0.0, step=0.01, value=None,
+                                  format="%.2f", key=k + "c")
+    s_shop = st.text_input("Shop", placeholder="Optional", key=k + "s")
+    s_notes = st.text_area("Notes", placeholder="Parts used, next due, warranty...", key=k + "n")
+    s_file = None
+    if receipts_enabled():
+        s_file = st.file_uploader("Receipt (photo or PDF)", type=RECEIPT_TYPES, key=k + "r")
+
+    label = ("Log service" if len(jobs) <= 1 else f"Log {len(jobs)} services")
+    if st.button(label, width="stretch", type="primary", key=k + "go"):
+        if not jobs:
+            st.error("Pick at least one service, or type what was done.")
+        else:
+            url = fid = ""
+            if s_file:
+                try:
+                    with st.spinner("Uploading receipt..."):
+                        url, fid = upload_receipt(
+                            s_file, f"{s_date.isoformat()} {car_name} {' + '.join(jobs)}")
+                except Exception as e:
+                    st.error(f"Receipt didn't upload ({e}). Nothing was saved yet. Try again.")
+                    st.stop()
+            visit = uuid.uuid4().hex[:10]
+            rows = []
+            for i, j in enumerate(jobs):
+                if per_item:
+                    cost = item_costs.get(j)
+                elif s_total is None:
+                    cost = None
+                else:
+                    cost = s_total if i == 0 else 0
+                note = s_notes.strip()
+                if not per_item and i > 0 and s_total is not None:
+                    note = (note + " · " if note else "") + f"Cost included with {jobs[0]}"
+                rows.append({"entry_id": uuid.uuid4().hex[:10], "car_id": car_id,
+                             "date": s_date.isoformat(),
+                             "odometer": int(s_odo) if s_odo else "",
+                             "service_type": j,
+                             "cost": round(cost, 2) if cost is not None else "",
+                             "shop": s_shop.strip(), "notes": note,
+                             "receipt_url": url, "receipt_file_id": fid,
+                             "entered_by": driver, "logged_at": now_stamp(),
+                             "visit_id": visit})
+            append_many("Service", rows)
+            reset_form("svc")
+            what = jobs[0] if len(jobs) == 1 else f"{len(jobs)} services"
+            flash(f"Saved {what}" + (" with receipt" if url else ""))
+            st.rerun()
 
 # ---- Timeline: everything done to the car ----------------------------------
 with tab_time:
@@ -633,11 +763,21 @@ with tab_time:
         items.append({"kind": "Fuel", "date": r["date"], "odo": r["odometer"],
                       "title": "⛽ Fill-up", "amount": r["total_cost"], "detail": " · ".join(bits),
                       "notes": "", "receipt": "", "by": r["entered_by"]})
-    for _, r in svc.iterrows():
-        items.append({"kind": "Service", "date": r["date"], "odo": r["odometer"],
-                      "title": f"🔧 {r['service_type']}", "amount": r["cost"],
-                      "detail": r["shop"], "notes": r["notes"], "receipt": r["receipt_url"],
-                      "by": r["entered_by"]})
+    # One card per shop visit, listing everything done
+    if not svc.empty:
+        sv = svc.assign(_visit=[visit_key(r) for r in svc.to_dict("records")])
+        for _, g in sv.groupby("_visit", sort=False):
+            first = g.iloc[0]
+            notes = [n for n in dict.fromkeys(
+                        n.split(" · Cost included with")[0] for n in g["notes"])
+                     if n and not n.startswith("Cost included with")]
+            receipts = [u for u in g["receipt_url"] if u]
+            items.append({"kind": "Service", "date": first["date"], "odo": first["odometer"],
+                          "title": "🔧 " + " + ".join(dict.fromkeys(g["service_type"])),
+                          "amount": g["cost"].sum(min_count=1),
+                          "detail": first["shop"], "notes": "\n\n".join(notes),
+                          "receipt": receipts[0] if receipts else "",
+                          "by": first["entered_by"]})
 
     if not items:
         st.caption("Nothing logged yet for this car.")
@@ -794,24 +934,90 @@ with tab_sched:
 
 # ---- Trends ----------------------------------------------------------------
 with tab_trend:
-    if fuel.empty:
-        st.caption("Charts appear after a few fill-ups.")
+    today_ts = pd.Timestamp(date.today())
+
+    # ---- Spending: monthly and yearly averages ----
+    st.subheader("💵 Spending")
+    scope = st.radio("Include", [car_name, "Both cars" if len(cars) == 2 else "All cars"],
+                     horizontal=True, key="spend_scope")
+    both = scope != car_name
+    pv = monthly_spend(fuel_all if both else fuel, svc_all if both else svc)
+    if pv.empty:
+        st.caption("Spending appears after your first fill-up or service.")
     else:
+        pv["Total"] = pv["Gas"] + pv["Service"]
+        n_months = len(pv)
+        avg_month = pv["Total"].mean()
+        a, b = st.columns(2)
+        a.metric("Average per month", money(avg_month),
+                 help=f"Gas {money(pv['Gas'].mean())} + service {money(pv['Service'].mean())}")
+        b.metric("Average per year", money(avg_month * 12))
+        c, d = st.columns(2)
+        c.metric(f"{today_ts.year} so far", money(pv.loc[pv.index.year == today_ts.year, "Total"].sum()))
+        d.metric("Last 12 months", money(pv["Total"].iloc[-12:].sum()))
+        st.caption(f"Averages cover {n_months} months, {pv.index.min().strftime('%b %Y')} to now. "
+                   "Months with nothing logged count as $0, so unlogged fill-ups pull them down.")
+
+        yearly = pv.groupby(pv.index.year).agg(Gas=("Gas", "sum"), Service=("Service", "sum"),
+                                                Total=("Total", "sum"), Months=("Total", "size"))
+        yearly["Per month"] = yearly["Total"] / yearly["Months"]
+        yearly.index = yearly.index.astype(str)
+        st.markdown("**By year**")
+        st.bar_chart(yearly[["Gas", "Service"]], height=220)
+        st.dataframe(
+            yearly.sort_index(ascending=False).reset_index(names="Year")
+            [["Year", "Gas", "Service", "Total", "Per month"]],
+            hide_index=True, width="stretch", column_config={
+                c: st.column_config.NumberColumn(c, format="$%.2f")
+                for c in ("Gas", "Service", "Total", "Per month")})
+        st.caption("Per month for the current year counts only the months so far.")
+
+        st.markdown("**Last 24 months**")
+        recent = pv[["Gas", "Service"]].iloc[-24:]
+        recent.index = recent.index.to_timestamp()
+        st.bar_chart(recent, height=220)
+
+    # ---- Fill-up frequency (this car) ----
+    st.subheader("⛽ How often you fill up")
+    fs = fuel.dropna(subset=["date"]).sort_values(["date", "odometer"])
+    if len(fs) < 2:
+        st.caption("Needs at least two fill-ups.")
+    else:
+        start = max(today_ts - pd.Timedelta(days=365), fs["date"].min())
+        rec = fs[fs["date"] >= start]
+        window = "last 12 months" if start > fs["date"].min() else "since your first fill-up"
+        months_span = max((today_ts - start).days / 30.44, 1)
+        gaps_d = rec["date"].diff().dt.days
+        gaps_mi = rec["odometer"].diff()
+        ok = rec["missed_before"].eq(False) & gaps_d.notna()
+        typ_days = gaps_d[ok & (gaps_d > 0)].median()  # skip same-day top-ups
+        typ_miles = gaps_mi[ok & (gaps_mi > 0)].median()
+        a, b = st.columns(2)
+        a.metric("Fill-ups per month", f"{len(rec) / months_span:.1f}")
+        b.metric("Typical days between", f"{typ_days:.0f}" if pd.notna(typ_days) else "--")
+        c, d = st.columns(2)
+        c.metric("Typical miles between", f"{typ_miles:,.0f}" if pd.notna(typ_miles) else "--")
+        c_days = (today_ts - fs["date"].max()).days
+        d.metric("Days since last fill-up", f"{c_days}")
+        st.caption(f"Based on {len(rec)} fill-ups, {window}. 'Typical' is the middle value, "
+                   "so one long road trip doesn't skew it. Same-day top-ups and gaps after a missed fill-up are skipped.")
+        per_month = fs.set_index("date").resample("MS").size()
+        per_month = per_month.reindex(pd.date_range(per_month.index.min(),
+                                                    today_ts.to_period("M").to_timestamp(),
+                                                    freq="MS"), fill_value=0).iloc[-24:]
+        st.markdown("**Fill-ups per month (last 24 months)**")
+        st.bar_chart(per_month.rename("Fill-ups"), height=200)
+
+    # ---- MPG and gas price ----
+    if not fuel.empty:
+        st.subheader("📈 MPG and gas price")
         f = fuel_with_mpg(fuel).sort_values("date")
         if f["mpg"].notna().sum() >= 2:
             st.markdown("**MPG over time**")
             st.line_chart(f.dropna(subset=["mpg"]).set_index("date")["mpg"], height=220)
         st.markdown("**Price per gallon**")
-        st.line_chart(f.dropna(subset=["price_per_gallon"]).set_index("date")["price_per_gallon"], height=220)
-        spend = pd.concat([
-            fuel.assign(kind="Gas", amt=fuel["total_cost"])[["date", "kind", "amt"]],
-            svc.assign(kind="Service", amt=svc["cost"])[["date", "kind", "amt"]],
-        ]).dropna(subset=["date"])
-        if not spend.empty:
-            st.markdown("**Spending by month**")
-            spend["month"] = spend["date"].dt.to_period("M").dt.to_timestamp()
-            st.bar_chart(spend.pivot_table(index="month", columns="kind", values="amt",
-                                           aggfunc="sum").fillna(0), height=220)
+        st.line_chart(f.dropna(subset=["price_per_gallon"]).set_index("date")["price_per_gallon"],
+                      height=220)
 
 # ---- Fix or delete an entry ------------------------------------------------
 with tab_fix:
@@ -883,6 +1089,11 @@ with tab_fix:
                 e_file = None
                 if r["receipt_url"]:
                     st.markdown(f"Current receipt: [open]({receipt_link(r['receipt_url'])})")
+                mates_n = sum(1 for m in svc.to_dict("records")
+                              if m["entry_id"] != eid and visit_key(m) == visit_key(r))
+                if mates_n:
+                    st.caption(f"Part of a visit with {mates_n} other item"
+                               f"{'s' if mates_n > 1 else ''}. A new receipt is added to all of them.")
                 if receipts_enabled():
                     e_file = st.file_uploader(
                         "Replace receipt" if r["receipt_url"] else "Add receipt",
@@ -904,7 +1115,16 @@ with tab_fix:
                     if e_file:
                         with st.spinner("Uploading receipt..."):
                             url, fid = upload_receipt(e_file, f"{e_date.isoformat()} {car_name} {e_type}")
-                        trash_receipt(r["receipt_file_id"])
+                        # Same receipt for everything from this visit
+                        vk = visit_key(r)
+                        mates = [m for m in svc.to_dict("records")
+                                 if m["entry_id"] != eid and visit_key(m) == vk]
+                        for m in mates:
+                            update("Service", m["entry_id"], {**m, "receipt_url": url,
+                                                              "receipt_file_id": fid})
+                        changed = {eid, *[m["entry_id"] for m in mates]}
+                        if not receipt_shared(r["receipt_file_id"], changed):
+                            trash_receipt(r["receipt_file_id"])
                     update("Service", eid, {**r, "date": e_date.isoformat(),
                                             "odometer": int(e_odo) if e_odo else "",
                                             "service_type": e_type.strip() or r["service_type"],
@@ -920,10 +1140,12 @@ with tab_fix:
         with st.expander("🗑️ Delete this entry"):
             sure = st.checkbox("Yes, delete it for good", key=f"del_{eid}")
             if st.button("Delete", disabled=not sure, key=f"delbtn_{eid}"):
-                if kind == "Service":
+                if kind == "Service" and not receipt_shared(r["receipt_file_id"], {eid}):
                     trash_receipt(r["receipt_file_id"])
                 delete(kind, eid)
                 flash("Entry deleted")
                 st.rerun()
 
 st.caption(f"Stored in your Google Sheet · loaded {datetime.now():%I:%M %p}")
+if me:
+    st.button(f"Sign out ({me})", on_click=st.logout, key="signout")
